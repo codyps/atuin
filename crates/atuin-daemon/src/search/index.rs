@@ -9,7 +9,7 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::pin::pin;
 use std::sync::Arc;
 
@@ -26,6 +26,8 @@ use parking_lot::{Mutex, RwLock};
 use time::OffsetDateTime;
 use tracing::{Level, error, instrument};
 use uuid::Uuid;
+
+use super::small_set::SmallSet;
 
 /// Error trying to load history from the database into the search index.
 #[derive(Debug, thiserror::Error)]
@@ -45,13 +47,13 @@ pub struct CommandData {
     count: u32,
 
     // Pre-computed indexes for O(1) filter lookups
-    // Using HashSet instead of DashSet since CommandData lives behind SearchIndex's lock
+    // Singletons stay inline; larger sets share the command map's synchronization.
     /// All directories where this command has been run (interned keys).
-    directories: HashSet<Spur>,
+    directories: SmallSet<Spur>,
     /// All hostnames where this command has been run (interned keys).
-    hosts: HashSet<Spur>,
+    hosts: SmallSet<Spur>,
     /// All sessions where this command has been run (as 16-byte UUIDs).
-    sessions: HashSet<Uuid>,
+    sessions: SmallSet<Uuid>,
 }
 
 impl CommandData {
@@ -70,9 +72,9 @@ impl CommandData {
             most_recent_id: history.id,
             most_recent_timestamp: timestamp,
             count: 1,
-            directories: HashSet::from([dir_key]),
-            hosts: HashSet::from([host_key]),
-            sessions: HashSet::from([session]),
+            directories: SmallSet::One(dir_key),
+            hosts: SmallSet::One(host_key),
+            sessions: SmallSet::One(session),
         })
     }
 
@@ -754,12 +756,21 @@ impl Default for SearchIndex {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use atuin_client::history::AuthorKind;
     use parking_lot::{MappedRwLockReadGuard, RwLockReadGuard};
     use rstest::{fixture, rstest};
     use time::macros::datetime;
 
     use super::*;
+
+    #[rstest]
+    fn command_metadata_is_smaller_than_three_hash_sets() {
+        type PreviousLayout =
+            (HistoryId, i64, u32, HashSet<Spur>, HashSet<Spur>, HashSet<Uuid>);
+        assert!(size_of::<CommandData>() < size_of::<PreviousLayout>());
+    }
 
     /// An empty history db.
     /// A session that started at 2024-01-01 12:00 UTC, with a UUIDv7 id that records it.
@@ -857,7 +868,10 @@ mod tests {
                 assert!(actual.has_invocation_in_dir(loaded.interner.get("/work/b/").unwrap()));
             }
             assert_eq!(actual.hosts.len(), expected.hosts.len());
-            assert_eq!(actual.sessions, expected.sessions);
+            assert_eq!(
+                actual.sessions.iter().copied().collect::<HashSet<_>>(),
+                expected.sessions.iter().copied().collect::<HashSet<_>>()
+            );
         }
     }
 
