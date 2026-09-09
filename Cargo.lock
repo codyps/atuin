@@ -514,6 +514,7 @@ dependencies = [
  "atuin-common",
  "atuin-domain",
  "atuin-history",
+ "codspeed-divan-compat",
  "dashmap",
  "derive_more",
  "divan",

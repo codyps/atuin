@@ -64,5 +64,9 @@ tonic-prost-build = { workspace = true }
 name = "output_index"
 harness = false
 
+[[bench]]
+name = "metadata"
+harness = false
+
 [lints]
 workspace = true

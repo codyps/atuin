@@ -3,6 +3,7 @@
 //! This module provides fuzzy search over command history using frizbee.
 
 mod index;
+mod small_set;
 
 use atuin_common::string::highlighted::FromHighlightedTextProtoError;
 use thiserror::Error;

@@ -9,7 +9,6 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::HashSet;
 use std::pin::pin;
 use std::sync::Arc;
 
@@ -26,6 +25,8 @@ use parking_lot::RwLock;
 use time::OffsetDateTime;
 use tracing::{Level, instrument};
 use uuid::Uuid;
+
+use super::small_set::SmallSet;
 
 /// Failure to (re)build a [`SearchIndex`] from the history database.
 #[derive(Debug, thiserror::Error)]
@@ -114,13 +115,13 @@ pub struct CommandData {
     pub global_frecency: FrecencyData,
 
     // Pre-computed indexes for O(1) filter lookups
-    // Using HashSet instead of DashSet since CommandData lives inside DashMap (already synchronized)
+    // Singletons stay inline; larger sets share the command map's synchronization.
     /// All directories where this command has been run (interned keys).
-    directories: HashSet<Spur>,
+    directories: SmallSet<Spur>,
     /// All hostnames where this command has been run (interned keys).
-    hosts: HashSet<Spur>,
+    hosts: SmallSet<Spur>,
     /// All sessions where this command has been run (as 16-byte UUIDs).
-    sessions: HashSet<Uuid>,
+    sessions: SmallSet<Uuid>,
     /// Position of this command in `SearchIndex::haystack`, so filtered
     /// searches can walk the command map without hashing command strings.
     haystack_index: u32,
@@ -153,9 +154,9 @@ impl CommandData {
             most_recent_id: history.id,
             most_recent_timestamp: timestamp,
             global_frecency,
-            directories: HashSet::from([dir_key]),
-            hosts: HashSet::from([host_key]),
-            sessions: HashSet::from([session]),
+            directories: SmallSet::One(dir_key),
+            hosts: SmallSet::One(host_key),
+            sessions: SmallSet::One(session),
             haystack_index,
         })
     }
@@ -640,10 +641,19 @@ impl Default for SearchIndex {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use rstest::{fixture, rstest};
     use time::macros::datetime;
 
     use super::*;
+
+    #[rstest]
+    fn command_metadata_is_smaller_than_three_hash_sets() {
+        type PreviousLayout =
+            (HistoryId, i64, FrecencyData, HashSet<Spur>, HashSet<Spur>, HashSet<Uuid>, u32);
+        assert!(size_of::<CommandData>() < size_of::<PreviousLayout>());
+    }
 
     #[fixture]
     async fn history_db() -> Sqlite {
@@ -701,7 +711,10 @@ mod tests {
                 assert!(actual.has_invocation_in_dir(loaded.interner.get("/work/b/").unwrap()));
             }
             assert_eq!(actual.hosts.len(), expected.hosts.len());
-            assert_eq!(actual.sessions, expected.sessions);
+            assert_eq!(
+                actual.sessions.iter().copied().collect::<HashSet<_>>(),
+                expected.sessions.iter().copied().collect::<HashSet<_>>()
+            );
         }
     }
 
