@@ -1,3 +1,6 @@
+mod by_ids;
+
+pub use by_ids::reorder_by_ids;
 use minspan::minspan;
 
 use super::database::DbSearchMode;

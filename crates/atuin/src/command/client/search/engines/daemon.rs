@@ -207,18 +207,11 @@ impl SearchEngine for Search {
         }
 
         // Hydrate from local database.
-        let mut results = self.hydrate_from_db(db, &ids).await?;
+        let results = self.hydrate_from_db(db, &ids).await?;
 
-        // Reorder to match the daemon's relevance ranking. `swap_remove` moves each hit out rather
-        // than cloning it; the scan stays O(n^2) but `ids` is capped at 200, where that beats a map.
-        let ordered_results = span!(Level::TRACE, "reorder_results").in_scope(|| {
-            ids.iter()
-                .filter_map(|id| {
-                    let pos = results.iter().position(|h| h.id == *id)?;
-                    Some(results.swap_remove(pos))
-                })
-                .collect::<Vec<History>>()
-        });
+        // Reorder results to match the daemon's relevance ranking.
+        let ordered_results = span!(Level::TRACE, "reorder_results")
+            .in_scope(|| atuin_client::ordering::reorder_by_ids(results, &ids));
 
         debug!(
             query = %query,
