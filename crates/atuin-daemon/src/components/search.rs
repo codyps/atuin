@@ -3,13 +3,12 @@
 //! Provides fuzzy search over command history using the Nucleo search library
 //! with frecency-based ranking and dynamic filtering.
 
-use std::pin::{Pin, pin};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use atuin_common::filter::OrFilter;
 use atuin_common::path::DisplayRichExt;
 use eyre::Result;
-use futures::TryStreamExt;
 use tokio::sync::RwLock;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};
@@ -86,12 +85,20 @@ impl SearchComponent {
             "Loading history into search index; page size = {}",
             SearchIndex::HISTORY_LOAD_PAGE_SIZE
         );
-        let mut pages = pin!(SearchIndex::history_pages(handle.history_db()));
-        while let Some(histories) =
-            pages.try_next().await.inspect_err(|e| error!("Failed to load history: {e}"))?
-        {
-            info!("Loading {} history entries into search index", histories.len());
-            index.read().await.add_histories(&histories);
+        let mut before = None;
+        loop {
+            // Hold the read guard for only one page so a filter change can
+            // replace the index between pages, rather than waiting for the scan.
+            let next = index
+                .read()
+                .await
+                .load_history_page(handle.history_db(), before)
+                .await
+                .inspect_err(|e| error!("Failed to load history: {e}"))?;
+            let Some(last_id) = next else {
+                break;
+            };
+            before = Some(last_id);
         }
 
         info!(

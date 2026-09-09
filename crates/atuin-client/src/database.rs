@@ -1,3 +1,5 @@
+mod index;
+
 use std::env;
 use std::ffi::OsStr;
 use std::path::PathBuf;
@@ -9,6 +11,7 @@ use atuin_common::time::OffsetDateTimeExt;
 use atuin_common::{db, utils};
 use atuin_domain::record::{CmdOrigin, UNKNOWN_USER};
 use easy_cast::{CastTo, Conv, Nearest, Trunc};
+pub use index::IndexHistoryRef;
 use itertools::Itertools;
 use sql_builder::bind::Bind;
 use sql_builder::{SqlBuilder, SqlName, esc, quote};
