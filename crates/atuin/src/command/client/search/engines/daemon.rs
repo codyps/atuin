@@ -209,18 +209,11 @@ impl SearchEngine for Search {
         }
 
         // Hydrate from local database.
-        let mut results = self.hydrate_from_db(db, &ids).await?;
+        let results = self.hydrate_from_db(db, &ids).await?;
 
-        // Reorder to match the daemon's relevance ranking. `swap_remove` moves each hit out rather
-        // than cloning it; the scan stays O(n^2) but `ids` is capped at 200, where that beats a map.
-        let ordered_results = span!(Level::TRACE, "reorder_results").in_scope(|| {
-            ids.iter()
-                .filter_map(|id| {
-                    let pos = results.iter().position(|h| h.id == *id)?;
-                    Some(results.swap_remove(pos))
-                })
-                .collect::<Vec<History>>()
-        });
+        // Reorder results to match the daemon's relevance ranking.
+        let ordered_results = span!(Level::TRACE, "reorder_results")
+            .in_scope(|| atuin_client::ordering::reorder_by_ids(results, &ids));
 
         debug!(
             query = %query,
@@ -282,12 +275,14 @@ impl SearchEngine for Search {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     /// Regression test: the daemon truncates queries before frizbee sees
     /// them, but highlighting used the raw input — a pasted query with an
     /// atom past frizbee's needle limit panicked in `Matcher::from_query`.
-    #[test]
+    #[rstest]
     fn long_query_does_not_panic_highlighting() {
         let engine = Search::new(&Settings::default());
         let long_query = "a".repeat(5000);
@@ -299,7 +294,7 @@ mod tests {
     /// and returns byte offsets into the original command — the renderer
     /// tests each display char's source byte against these ("echo déjà" is
     /// e0 c1 h2 o3 ␣4 d5 é6 j8 à9; é and à are two bytes each).
-    #[test]
+    #[rstest]
     fn accented_command_highlights_unaccented_query() {
         let engine = Search::new(&Settings::default());
         let indices = engine.get_highlight_indices("echo déjà", "deja");
@@ -309,7 +304,7 @@ mod tests {
     /// A multibyte char before the match must not shift the highlight:
     /// frizbee's offsets are into the normalized text ("emacs test"), which
     /// is one byte shorter than the command wherever é shrank to e.
-    #[test]
+    #[rstest]
     fn multibyte_char_before_match_does_not_shift_highlight() {
         let engine = Search::new(&Settings::default());
         let indices = engine.get_highlight_indices("émacs test", "test");
@@ -319,7 +314,7 @@ mod tests {
     /// Non-Latin text doesn't normalize, so matchable and command share a
     /// byte layout; offsets still land on the match ("日本 git" is 日0 本3
     /// ␣6 g7 i8 t9).
-    #[test]
+    #[rstest]
     fn cjk_prefix_highlights_at_correct_bytes() {
         let engine = Search::new(&Settings::default());
         let indices = engine.get_highlight_indices("日本 git", "git");
