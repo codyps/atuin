@@ -32,6 +32,10 @@ impl BenchCtx {
     ///
     /// Using the standard library will provide timestamps which are not stable and will result in
     /// irreproducible benchmarks.
+    #[expect(
+        clippy::unused_self,
+        reason = "keep clock access on the benchmark context alongside its seeded RNG"
+    )]
     pub fn now(&self) -> OffsetDateTime {
         Self::SEED_NOW
     }
