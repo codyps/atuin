@@ -39,6 +39,24 @@ pub fn is_known_agent(author: &str) -> bool {
     KNOWN_AGENTS.contains(&author)
 }
 
+/// Shared agent classification for owned history and borrowed index rows.
+pub(crate) fn is_agent_author(author: &str, kind: Option<AuthorKind>, origin: &str) -> bool {
+    match kind {
+        Some(kind) => kind == AuthorKind::Agent,
+        None => {
+            // Legacy colonless origins defaulted their author to the hostname.
+            // CmdOrigin normalizes those origins with the unknown-user marker.
+            let (host, user) = origin.split_once(':').unwrap_or((origin, UNKNOWN_USER));
+            let defaulted = if user == UNKNOWN_USER {
+                host
+            } else {
+                user
+            };
+            is_known_agent(author) && author != defaulted
+        }
+    }
+}
+
 /// Who wrote a history entry, as declared by whatever captured it.
 ///
 /// This is stored as a small integer, both on the wire and in the database, and is optional: an
@@ -434,22 +452,7 @@ impl History {
     /// the `pi` agent.
     #[must_use]
     pub fn is_agent(&self) -> bool {
-        match self.author_kind {
-            Some(kind) => kind == AuthorKind::Agent,
-            None => {
-                // The username the author would have defaulted to. `CmdOrigin::parse_lenient`
-                // maps a legacy colonless hostname to a placeholder user ("unknown-user"), but
-                // old writers defaulted the author to the whole hostname there — as does the SQL
-                // author filter's user expression — so compare against the host in that case.
-                let user = self.cmd_origin.user();
-                let defaulted = if user.as_ref() == UNKNOWN_USER {
-                    self.cmd_origin.host().into_inner()
-                } else {
-                    user.into_inner()
-                };
-                is_known_agent(&self.author) && self.author != defaulted
-            }
-        }
+        is_agent_author(&self.author, self.author_kind, self.cmd_origin.as_str())
     }
 
     /// Serializes a history entry in the V2 format.

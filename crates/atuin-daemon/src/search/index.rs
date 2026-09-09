@@ -9,17 +9,16 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::pin::pin;
 use std::sync::Arc;
 
-use atuin_client::database::Sqlite;
+use atuin_client::database::{IndexHistoryRef, Sqlite};
 use atuin_client::history::{History, HistoryId};
 use atuin_client::settings::Search;
 use atuin_common::filter::OrFilter;
 use atuin_common::path::DisplayRichExt;
 use dashmap::DashMap;
 use easy_cast::Conv;
-use futures::{Stream, TryStreamExt, stream};
+use futures::{Stream, stream};
 use lasso::{Spur, ThreadedRodeo};
 use parking_lot::RwLock;
 use time::OffsetDateTime;
@@ -132,7 +131,16 @@ impl CommandData {
     ///
     /// Returns [`None`] if the history entry has invalid UUIDs or if the haystack index exceeds
     /// 2^32.
+    #[cfg(test)]
     pub fn new(history: &History, haystack_index: usize, interner: &ThreadedRodeo) -> Option<Self> {
+        Self::from_index_history(&history.into(), haystack_index, interner)
+    }
+
+    fn from_index_history(
+        history: &IndexHistoryRef<'_>,
+        haystack_index: usize,
+        interner: &ThreadedRodeo,
+    ) -> Option<Self> {
         let Ok(haystack_index) = u32::try_from(haystack_index) else {
             // TODO: It's very unlikely that we'll have more than 2^32 history entries, but if that
             // ends up being a realistic possibility, we should handle this case better than simply
@@ -140,12 +148,12 @@ impl CommandData {
             return None;
         };
 
-        let session = Uuid::parse_str(&history.session).ok()?;
+        let session = Uuid::parse_str(history.session).ok()?;
         let timestamp = history.timestamp.unix_timestamp();
 
         let dir_key =
             interner.get_or_intern(history.cwd.display_rich().trailing_slash(true).to_string());
-        let host_key = interner.get_or_intern(history.cmd_origin.as_str());
+        let host_key = interner.get_or_intern(history.cmd_origin.as_ref());
 
         let mut global_frecency = FrecencyData::default();
         global_frecency.record_use(timestamp);
@@ -163,8 +171,17 @@ impl CommandData {
 
     /// Add an invocation from a history entry.
     /// Returns false if the history entry has invalid UUIDs.
+    #[cfg(test)]
     pub fn add_invocation(&mut self, history: &History, interner: &ThreadedRodeo) -> bool {
-        let Some(session) = Uuid::parse_str(&history.session).ok() else {
+        self.add_index_invocation(&history.into(), interner)
+    }
+
+    fn add_index_invocation(
+        &mut self,
+        history: &IndexHistoryRef<'_>,
+        interner: &ThreadedRodeo,
+    ) -> bool {
+        let Some(session) = Uuid::parse_str(history.session).ok() else {
             return false;
         };
 
@@ -177,7 +194,7 @@ impl CommandData {
         let dir_key =
             interner.get_or_intern(history.cwd.display_rich().trailing_slash(true).to_string());
         self.directories.insert(dir_key);
-        self.hosts.insert(interner.get_or_intern(history.cmd_origin.as_str()));
+        self.hosts.insert(interner.get_or_intern(history.cmd_origin.as_ref()));
         self.sessions.insert(session);
 
         // Update most recent if this invocation is newer
@@ -396,11 +413,24 @@ impl SearchIndex {
 
     /// Load every history entry from `db` into this index.
     pub async fn load_from_db(&self, db: &Sqlite) -> Result<(), LoadFromDbError> {
-        let mut pages = pin!(Self::history_pages(db));
-        while let Some(histories) = pages.try_next().await? {
-            self.add_histories(&histories);
+        let mut before = None;
+        while let Some(last_id) = self.load_history_page(db, before).await? {
+            before = Some(last_id);
         }
         Ok(())
+    }
+
+    /// Consume one bounded page without allocating intermediate History strings.
+    pub async fn load_history_page(
+        &self,
+        db: &Sqlite,
+        before: Option<HistoryId>,
+    ) -> Result<Option<HistoryId>, LoadFromDbError> {
+        db.visit_index_history_page(before, Self::HISTORY_LOAD_PAGE_SIZE, |history| {
+            self.add_index_history(&history);
+        })
+        .await
+        .map_err(|error| LoadFromDbError(error.into()))
     }
 
     /// Stream every active history entry in `db`, one page at a time.
@@ -425,27 +455,32 @@ impl SearchIndex {
     /// If the command already exists, updates its invocation data.
     /// If it's a new command, adds it to both the map and Nucleo.
     pub fn add_history(&self, history: &History) {
+        self.add_index_history(&history.into());
+    }
+
+    fn add_index_history(&self, history: &IndexHistoryRef<'_>) {
         if history.is_agent() {
             return;
         }
-        if !self.shells.contains(history.shell.as_deref().unwrap_or_default()) {
+        if !self.shells.contains(history.shell.unwrap_or_default()) {
             return;
         }
 
-        let command = history.command.as_str();
+        let command = history.command;
 
         // DashMap with Arc<str> keys can be looked up with &str via Borrow trait
         if let Some(mut entry) = self.commands.get_mut(command) {
             // Existing command - just update invocations
-            entry.add_invocation(history, &self.interner);
+            entry.add_index_invocation(history, &self.interner);
         } else {
             let mut haystack = self.haystack.write();
             match self.commands.entry(Arc::from(command)) {
                 dashmap::Entry::Occupied(mut entry) => {
-                    entry.get_mut().add_invocation(history, &self.interner);
+                    entry.get_mut().add_index_invocation(history, &self.interner);
                 }
                 dashmap::Entry::Vacant(vacant) => {
-                    let Some(data) = CommandData::new(history, haystack.len(), &self.interner)
+                    let Some(data) =
+                        CommandData::from_index_history(history, haystack.len(), &self.interner)
                     else {
                         return; // Skip invalid commands
                     };
@@ -716,6 +751,28 @@ mod tests {
                 expected.sessions.iter().copied().collect::<HashSet<_>>()
             );
         }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn borrowed_reload_preserves_exclusions(#[future(awt)] history_db: Sqlite) {
+        let mut histories: Vec<_> = ["shown", "agent", "other shell", "invalid session"]
+            .into_iter()
+            .map(|command| {
+                let mut h = make_history(command, "/work", datetime!(2024-01-01 0:00 UTC));
+                h.shell = Some("bash".into());
+                h
+            })
+            .collect();
+        histories[1].author_kind = Some(atuin_client::history::AuthorKind::Agent);
+        histories[2].shell = Some("zsh".into());
+        histories[3].session = "not a uuid".into();
+        history_db.save_bulk(&histories).await.unwrap();
+        let shells = OrFilter::from_list(vec!["bash".to_owned()]).unwrap();
+        let loaded = SearchIndex::new(shells);
+        loaded.load_from_db(&history_db).await.unwrap();
+        assert_eq!(loaded.command_count(), 1);
+        assert!(loaded.commands.contains_key("shown"));
     }
 
     fn make_history(command: &str, cwd: &str, timestamp: OffsetDateTime) -> History {
