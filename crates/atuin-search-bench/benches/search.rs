@@ -24,6 +24,8 @@
 //! Sampling is divan's own; tune with `DIVAN_MAX_TIME`, `DIVAN_SAMPLE_COUNT`,
 //! etc. if needed.
 
+mod loader;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, OnceLock};
@@ -37,6 +39,9 @@ use atuin_search_bench::corpus;
 use easy_cast::Conv;
 use parking_lot::Mutex;
 use time::OffsetDateTime;
+
+#[global_allocator]
+static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
 
 fn main() {
     divan::main();

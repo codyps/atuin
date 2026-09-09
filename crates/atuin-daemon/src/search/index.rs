@@ -180,7 +180,9 @@ impl CommandData {
         self.sessions.insert(session);
 
         // Update most recent if this invocation is newer
-        if timestamp > self.most_recent_timestamp {
+        if (timestamp, history.id.into_bytes())
+            > (self.most_recent_timestamp, self.most_recent_id.into_bytes())
+        {
             self.most_recent_id = history.id;
             self.most_recent_timestamp = timestamp;
         }
@@ -400,10 +402,13 @@ impl SearchIndex {
         Ok(())
     }
 
-    /// Stream every history entry in `db`, one page at a time.
+    /// Stream every active history entry in `db`, one page at a time.
+    ///
+    /// Count every invocation, just like live insertion. Grouping each page both
+    /// loses frequency information and repeatedly aggregates the remaining table.
     pub fn history_pages(db: &Sqlite) -> impl Stream<Item = Result<Vec<History>, LoadFromDbError>> {
         stream::try_unfold(
-            db.all_paged(Self::HISTORY_LOAD_PAGE_SIZE, false, true),
+            db.all_paged(Self::HISTORY_LOAD_PAGE_SIZE, false, false),
             |mut pager| async move {
                 match pager.next().await {
                     Ok(Some(histories)) => Ok(Some((histories, pager))),
@@ -632,16 +637,76 @@ impl Default for SearchIndex {
 
 #[cfg(test)]
 mod tests {
-    use rstest::rstest;
+    use rstest::{fixture, rstest};
     use time::macros::datetime;
 
     use super::*;
+
+    #[fixture]
+    async fn history_db() -> Sqlite {
+        Sqlite::in_memory(std::time::Duration::from_secs(5)).await.unwrap()
+    }
+
+    #[rstest]
+    #[case::empty(0)]
+    #[case::duplicates(12)]
+    #[case::page_boundary(SearchIndex::HISTORY_LOAD_PAGE_SIZE + 1)]
+    #[tokio::test]
+    async fn reload_matches_live_invocations(
+        #[future(awt)] history_db: Sqlite,
+        #[case] count: usize,
+    ) {
+        let histories: Vec<_> = (0..count)
+            .map(|i| {
+                let mut history = make_history(
+                    "git status",
+                    if i % 2 == 0 {
+                        "/work/a"
+                    } else {
+                        "/work/b"
+                    },
+                    datetime!(2024-01-01 0:00 UTC)
+                        + time::Duration::seconds(i64::conv(i % 7))
+                        + time::Duration::nanoseconds(i64::conv(i)),
+                );
+                history.id = HistoryId::from_bytes(u128::conv(i + 1).to_be_bytes());
+                history.session = "00000000000000000000000000000001".into();
+                history
+            })
+            .collect();
+        let mut deleted = make_history("deleted", "/work/a", datetime!(2024-01-01 0:00 UTC));
+        deleted.deleted_at = Some(datetime!(2024-01-02 0:00 UTC));
+        history_db.save_bulk(histories.iter().chain([&deleted])).await.unwrap();
+
+        let loaded = SearchIndex::default();
+        loaded.load_from_db(&history_db).await.unwrap();
+        let live = SearchIndex::default();
+        // Live insertion is ascending by ID, opposite to database pagination.
+        live.add_histories(&histories);
+        assert_eq!(loaded.command_count(), live.command_count());
+        assert!(!loaded.commands.contains_key("deleted"));
+        if count > 0 {
+            let actual = loaded.commands.get("git status").unwrap();
+            let expected = live.commands.get("git status").unwrap();
+            assert_eq!(actual.global_frecency.count, u32::conv(count));
+            assert_eq!(actual.global_frecency.count, expected.global_frecency.count);
+            assert_eq!(actual.global_frecency.last_used, expected.global_frecency.last_used);
+            assert_eq!(actual.most_recent_id, expected.most_recent_id);
+            assert_eq!(actual.directories.len(), expected.directories.len());
+            assert!(actual.has_invocation_in_dir(loaded.interner.get("/work/a/").unwrap()));
+            if count > 1 {
+                assert!(actual.has_invocation_in_dir(loaded.interner.get("/work/b/").unwrap()));
+            }
+            assert_eq!(actual.hosts.len(), expected.hosts.len());
+            assert_eq!(actual.sessions, expected.sessions);
+        }
+    }
 
     fn make_history(command: &str, cwd: &str, timestamp: OffsetDateTime) -> History {
         History::import().timestamp(timestamp).command(command).cwd(cwd).build().into()
     }
 
-    #[test]
+    #[rstest]
     fn frecency_data_compute() {
         let now = 1_000_000_i64;
 
@@ -668,7 +733,7 @@ mod tests {
         assert!(frequent_old.compute(now, 1.0, 1.0) > 50);
     }
 
-    #[test]
+    #[rstest]
     fn frecency_data_compute_with_multipliers() {
         let now = 1_000_000_i64;
 
@@ -711,7 +776,7 @@ mod tests {
         assert!(boost_recency < double_recency);
     }
 
-    #[test]
+    #[rstest]
     fn command_data_add_invocation() {
         let interner = ThreadedRodeo::new();
 
@@ -736,7 +801,7 @@ mod tests {
         assert_ne!(id1, id2);
     }
 
-    #[test]
+    #[rstest]
     fn command_data_filters() {
         let interner = ThreadedRodeo::new();
 
@@ -791,7 +856,7 @@ mod tests {
         assert!(!data.has_invocation_in_workspace(&check3, &interner));
     }
 
-    #[test]
+    #[rstest]
     fn search_index_add_and_search() {
         let index = SearchIndex::default();
 
@@ -829,7 +894,7 @@ mod tests {
     /// Regression test for #3702: a frequently-run command whose match is
     /// scattered across words must not outrank a contiguous match, no matter
     /// how large its frecency score is.
-    #[test]
+    #[rstest]
     fn contiguous_match_beats_frequent_scattered_match() {
         let index = SearchIndex::default();
 
@@ -859,7 +924,7 @@ mod tests {
     /// Frecency still orders results between equally good matches, so
     /// most-recently/frequently-used behavior is preserved where match
     /// quality can't differentiate.
-    #[test]
+    #[rstest]
     fn equal_matches_order_by_frecency() {
         let index = SearchIndex::default();
 
@@ -885,7 +950,7 @@ mod tests {
     /// the index normalizes both sides — an unaccented query must keep
     /// matching accented history entries (nucleo's old Normalization::Smart
     /// behavior), and an accented query must still find its own entry.
-    #[test]
+    #[rstest]
     fn diacritics_normalized_for_matching() {
         let index = SearchIndex::default();
 
@@ -922,7 +987,7 @@ mod tests {
     /// frizbee's match_list_parallel must return exactly the same matches,
     /// scores, and order as match_list for our config. Guards the 10k
     /// threshold in search(), which machines cross as history grows.
-    #[test]
+    #[rstest]
     fn parallel_matching_equals_serial() {
         let corpus = equivalence_corpus();
         let haystack: Vec<&str> = corpus.iter().map(String::as_str).collect();
@@ -950,7 +1015,7 @@ mod tests {
 
     /// End-to-end determinism above the parallel threshold: the same query
     /// against the same index must return the same ranked IDs every time.
-    #[test]
+    #[rstest]
     fn search_results_stable_above_parallel_threshold() {
         let index = SearchIndex::default();
         for (i, command) in equivalence_corpus().iter().enumerate() {
@@ -972,7 +1037,7 @@ mod tests {
 
     /// Queries longer than frizbee can score are truncated instead of
     /// panicking in Matcher::from_query.
-    #[test]
+    #[rstest]
     fn long_query_truncated_not_panicking() {
         let index = SearchIndex::default();
         index.add_history(&make_history("echo hello", "/tmp", datetime!(2024-01-01 10:00 UTC)));
