@@ -95,7 +95,9 @@ impl CommandData {
         self.sessions.insert(session);
 
         // Update most recent if this invocation is newer
-        if timestamp > self.most_recent_timestamp {
+        if (timestamp, history.id.into_bytes())
+            > (self.most_recent_timestamp, self.most_recent_id.into_bytes())
+        {
             self.most_recent_id = history.id;
             self.most_recent_timestamp = timestamp;
         }
@@ -502,7 +504,10 @@ impl SearchIndex {
         Ok(())
     }
 
-    /// Stream every history entry in `db`, one page at a time.
+    /// Stream every active history entry in `db`, one page at a time.
+    ///
+    /// Count every invocation, just like live insertion. Grouping each page both
+    /// loses frequency information and repeatedly aggregates the remaining table.
     pub fn history_pages(db: &Sqlite) -> impl Stream<Item = Result<Vec<History>, LoadFromDbError>> {
         stream::try_unfold(
             db.all_paged(Self::HISTORY_LOAD_PAGE_SIZE, false),
@@ -801,6 +806,59 @@ mod tests {
         data.count = count;
         data.most_recent_timestamp = most_recent_timestamp;
         data
+    }
+
+    /// A reload from the database must match what live insertion builds,
+    /// including frequency counts for duplicate commands.
+    #[rstest]
+    #[case::empty(0)]
+    #[case::duplicates(12)]
+    #[case::page_boundary(SearchIndex::HISTORY_LOAD_PAGE_SIZE + 1)]
+    #[tokio::test]
+    async fn reload_matches_live_invocations(
+        #[future(awt)] db: Sqlite,
+        #[case] count: usize,
+    ) {
+        let histories: Vec<_> = (0..count)
+            .map(|i| {
+                let mut history = make_history(
+                    "git status",
+                    if i % 2 == 0 { "/work/a" } else { "/work/b" },
+                    datetime!(2024-01-01 0:00 UTC)
+                        + time::Duration::seconds(i64::conv(i % 7))
+                        + time::Duration::nanoseconds(i64::conv(i)),
+                );
+                history.id = HistoryId::from_bytes(u128::conv(i + 1).to_be_bytes());
+                history.session = "00000000000000000000000000000001".into();
+                history
+            })
+            .collect();
+        let mut deleted = make_history("deleted", "/work/a", datetime!(2024-01-01 0:00 UTC));
+        deleted.deleted_at = Some(datetime!(2024-01-02 0:00 UTC));
+        db.save_bulk(histories.iter().chain([&deleted])).await.unwrap();
+
+        let loaded = SearchIndex::default();
+        loaded.load_from_db(&db).await.unwrap();
+        let live = SearchIndex::default();
+        // Live insertion is ascending by ID, opposite to database pagination.
+        live.add_histories(&histories);
+        assert_eq!(loaded.command_count(), live.command_count());
+        assert!(!loaded.commands.read().indices.contains_key("deleted"));
+        if count > 0 {
+            let actual = command(&loaded, "git status");
+            let expected = command(&live, "git status");
+            assert_eq!(actual.count, u32::conv(count));
+            assert_eq!(actual.count, expected.count);
+            assert_eq!(actual.most_recent_timestamp, expected.most_recent_timestamp);
+            assert_eq!(actual.most_recent_id, expected.most_recent_id);
+            assert_eq!(actual.directories.len(), expected.directories.len());
+            assert!(actual.has_invocation_in_dir(loaded.interner.get("/work/a/").unwrap()));
+            if count > 1 {
+                assert!(actual.has_invocation_in_dir(loaded.interner.get("/work/b/").unwrap()));
+            }
+            assert_eq!(actual.hosts.len(), expected.hosts.len());
+            assert_eq!(actual.sessions, expected.sessions);
+        }
     }
 
     #[rstest]
