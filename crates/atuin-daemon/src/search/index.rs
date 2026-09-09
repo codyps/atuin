@@ -10,17 +10,16 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::pin::pin;
 use std::sync::Arc;
 
-use atuin_client::database::Sqlite;
+use atuin_client::database::{IndexHistoryRef, Sqlite};
 use atuin_client::history::{History, HistoryId, ShellSession};
 use atuin_client::settings::Search;
 use atuin_common::filter::OrFilter;
 use atuin_common::path::DisplayRichExt;
 use easy_cast::Conv;
 use fixedbitset::FixedBitSet;
-use futures::{Stream, TryStreamExt, stream};
+use futures::{Stream, stream};
 use lasso::{Spur, ThreadedRodeo};
 use parking_lot::{Mutex, RwLock};
 use time::OffsetDateTime;
@@ -60,13 +59,21 @@ impl CommandData {
     /// Create a new CommandData from a history entry.
     ///
     /// Returns [`None`] if the history entry has invalid UUIDs.
+    #[cfg(test)]
     pub fn new(history: &History, interner: &ThreadedRodeo) -> Option<Self> {
-        let session = Uuid::parse_str(&history.session).ok()?;
+        Self::from_index_history(&history.into(), interner)
+    }
+
+    fn from_index_history(
+        history: &IndexHistoryRef<'_>,
+        interner: &ThreadedRodeo,
+    ) -> Option<Self> {
+        let session = Uuid::parse_str(history.session).ok()?;
         let timestamp = history.timestamp.unix_timestamp();
 
         let dir_key =
             interner.get_or_intern(history.cwd.display_rich().trailing_slash(true).to_string());
-        let host_key = interner.get_or_intern(history.cmd_origin.as_str());
+        let host_key = interner.get_or_intern(history.cmd_origin.as_ref());
 
         Some(Self {
             most_recent_id: history.id,
@@ -80,8 +87,17 @@ impl CommandData {
 
     /// Add an invocation from a history entry.
     /// Returns false if the history entry has invalid UUIDs.
+    #[cfg(test)]
     pub fn add_invocation(&mut self, history: &History, interner: &ThreadedRodeo) -> bool {
-        let Some(session) = Uuid::parse_str(&history.session).ok() else {
+        self.add_index_invocation(&history.into(), interner)
+    }
+
+    fn add_index_invocation(
+        &mut self,
+        history: &IndexHistoryRef<'_>,
+        interner: &ThreadedRodeo,
+    ) -> bool {
+        let Some(session) = Uuid::parse_str(history.session).ok() else {
             return false;
         };
 
@@ -93,7 +109,7 @@ impl CommandData {
         let dir_key =
             interner.get_or_intern(history.cwd.display_rich().trailing_slash(true).to_string());
         self.directories.insert(dir_key);
-        self.hosts.insert(interner.get_or_intern(history.cmd_origin.as_str()));
+        self.hosts.insert(interner.get_or_intern(history.cmd_origin.as_ref()));
         self.sessions.insert(session);
 
         // Update most recent if this invocation is newer
@@ -377,12 +393,12 @@ impl Commands {
     }
 
     /// Add a history entry. See [`SearchIndex::add_history`].
-    pub fn add(&mut self, history: &History, interner: &ThreadedRodeo) {
-        let command = history.command.as_str();
+    fn add_index(&mut self, history: &IndexHistoryRef<'_>, interner: &ThreadedRodeo) {
+        let command = history.command;
 
         if let Some(&index) = self.indices.get(command) {
             // Existing command - just update invocations
-            self.data[usize::conv(index)].add_invocation(history, interner);
+            self.data[usize::conv(index)].add_index_invocation(history, interner);
             self.num_total += 1;
             return;
         }
@@ -394,7 +410,7 @@ impl Commands {
             return;
         };
 
-        let Some(data) = CommandData::new(history, interner) else {
+        let Some(data) = CommandData::from_index_history(history, interner) else {
             return; // Skip invalid commands
         };
 
@@ -499,11 +515,24 @@ impl SearchIndex {
 
     /// Load every history entry from `db` into this index.
     pub async fn load_from_db(&self, db: &Sqlite) -> Result<(), LoadFromDbError> {
-        let mut pages = pin!(Self::history_pages(db));
-        while let Some(histories) = pages.try_next().await? {
-            self.add_histories(&histories);
+        let mut before = None;
+        while let Some(last_id) = self.load_history_page(db, before).await? {
+            before = Some(last_id);
         }
         Ok(())
+    }
+
+    /// Consume one bounded page without allocating intermediate History strings.
+    pub async fn load_history_page(
+        &self,
+        db: &Sqlite,
+        before: Option<HistoryId>,
+    ) -> Result<Option<HistoryId>, LoadFromDbError> {
+        db.visit_index_history_page(before, Self::HISTORY_LOAD_PAGE_SIZE, |history| {
+            self.add_index_history(&history);
+        })
+        .await
+        .map_err(|error| LoadFromDbError(error.into()))
     }
 
     /// Stream every active history entry in `db`, one page at a time.
@@ -528,15 +557,19 @@ impl SearchIndex {
     /// If the command already exists, updates its invocation data.
     /// If it's a new command, adds it to both the map and Nucleo.
     pub fn add_history(&self, history: &History) {
+        self.add_index_history(&history.into());
+    }
+
+    fn add_index_history(&self, history: &IndexHistoryRef<'_>) {
         if history.is_agent() {
             return;
         }
-        if !self.shells.contains(history.shell.as_deref().unwrap_or_default()) {
+        if !self.shells.contains(history.shell.unwrap_or_default()) {
             return;
         }
 
         let mut commands = self.commands.write();
-        commands.add(history, &self.interner);
+        commands.add_index(history, &self.interner);
 
         // Continue holding the write lock on `commands`, so this doesn't interleave with
         // `prepare_session_preload` installing a new cache.
@@ -873,6 +906,28 @@ mod tests {
                 expected.sessions.iter().copied().collect::<HashSet<_>>()
             );
         }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn borrowed_reload_preserves_exclusions(#[future(awt)] db: Sqlite) {
+        let mut histories: Vec<_> = ["shown", "agent", "other shell", "invalid session"]
+            .into_iter()
+            .map(|command| {
+                let mut h = make_history(command, "/work", datetime!(2024-01-01 0:00 UTC));
+                h.shell = Some("bash".into());
+                h
+            })
+            .collect();
+        histories[1].author_kind = Some(AuthorKind::Agent);
+        histories[2].shell = Some("zsh".into());
+        histories[3].session = "not a uuid".into();
+        db.save_bulk(&histories).await.unwrap();
+        let shells = OrFilter::from_list(vec!["bash".to_owned()]).unwrap();
+        let loaded = SearchIndex::new(shells);
+        loaded.load_from_db(&db).await.unwrap();
+        assert_eq!(loaded.command_count(), 1);
+        assert!(loaded.commands.read().indices.contains_key("shown"));
     }
 
     #[rstest]
