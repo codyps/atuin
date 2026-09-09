@@ -49,6 +49,7 @@ uuid = { workspace = true }
 listenfd = { workspace = true }
 
 [dev-dependencies]
+divan = { workspace = true }
 atuin-common = { workspace = true, features = ["os", "sqlite"] }
 proptest = { workspace = true }
 rstest = { workspace = true }
@@ -58,6 +59,10 @@ tempfile = { workspace = true }
 protox = { workspace = true }
 tonic-build = { workspace = true }
 tonic-prost-build = { workspace = true }
+
+[[bench]]
+name = "metadata"
+harness = false
 
 [lints]
 workspace = true

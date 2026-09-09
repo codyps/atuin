@@ -3,6 +3,7 @@
 //! This module provides fuzzy search over command history using frizbee.
 
 mod index;
+mod small_set;
 
 // Include the generated proto code
 mod proto {
