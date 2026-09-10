@@ -1,4 +1,5 @@
 mod _util;
+mod fuzzy_scoring;
 mod history;
 mod history_store;
 mod ordering;
