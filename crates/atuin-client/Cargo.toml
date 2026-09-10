@@ -47,7 +47,6 @@ interim = { workspace = true }
 itertools = { workspace = true }
 libsqlite3-sys = { workspace = true }
 memchr = { workspace = true }
-minspan = { workspace = true }
 notify = { workspace = true }
 prost = { workspace = true, optional = true }
 rand = { workspace = true }
@@ -93,6 +92,7 @@ strum_macros = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
+minspan = { workspace = true }
 # This crate's tests require the `test-utils` feature in atuin-common.
 atuin-common = { workspace = true, features = ["test-utils"] }
 pretty_assertions = { workspace = true }
