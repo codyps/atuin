@@ -196,7 +196,7 @@ proptest! {
     fn any_valid_history_persists_and_indexes_consistently(h in strategies::valid_history()) {
         common::current_thread_runtime().block_on(async {
             let env = TestEnv::builder().build().await;
-            let id = env.journal.start_cmd(h.clone());
+            let id = env.journal.start_cmd(h.clone()).await.unwrap();
             env.journal.finish(id, 0, Duration::from_millis(1)).await.unwrap();
 
             let stored = env.history_db.load(id).await.unwrap().expect("row persisted");
@@ -387,6 +387,7 @@ enum Target {
 /// index on that triple plus `insert or ignore` (both older than the daemon) mean the second is
 /// reported as recorded but never lands in the db. Pinned here so the proptest above can rely on
 /// it; if the daemon ever starts rejecting or replacing the duplicate, update both.
+#[rstest]
 #[tokio::test]
 async fn an_exact_repeat_is_deduped_by_the_history_db() {
     let env = TestEnv::builder().build().await;

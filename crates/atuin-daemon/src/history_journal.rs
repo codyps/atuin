@@ -16,6 +16,9 @@
 //! Commands-in-flight are commands which have been started but are already running. These commands
 //! are uniquely identified by their [`HistoryId`].
 //!
+//! Started commands are saved locally and indexed immediately, but only finished commands are
+//! written to the sync record store. Finishing updates the existing row; cancellation removes it.
+//!
 //! Commands in flight can be terminated in one of three ways:
 //!
 //!   - [`HistoryJournal::finish`] marks the command as finished, which will create and store a new
@@ -135,8 +138,8 @@ struct InFlightCmd {
     /// finish is supposed to:
     ///   1. x := read(active_cmds, cmd)
     ///      ^--- BORROW (not pop) the command from the shared active_cmds map into the stack.
-    ///   2. history_db.save(x).await
-    ///      ^--- store the command into the history database (new row)
+    ///   2. history_db.update(x).await
+    ///      ^--- update the command in the history database
     ///   3. history_store.push(create(X)).await
     ///      ^--- append a creation event to the history store.
     ///   4. pop(active_cmds, cmd)
@@ -256,6 +259,8 @@ pub enum CmdRebuildError {
 pub enum CmdCancelError {
     #[error("command {0} is not in flight")]
     NotFound(HistoryId),
+    #[error("removing unfinished history from db failed: {0}")]
+    HistoryDbFailed(eyre::Report),
 }
 
 /// Errors returned by [`HistoryJournal::register_command_output`].
@@ -305,9 +310,13 @@ impl HistoryJournal {
     ///
     /// Returns the [`HistoryId`] identifying the in-flight command, which is later used to
     /// [`HistoryJournal::finish`] or [`HistoryJournal::cancel`] it.
-    #[must_use]
-    pub fn start_cmd(&self, history: History) -> HistoryId {
+    pub async fn start_cmd(&self, history: History) -> eyre::Result<HistoryId> {
         let id = history.id;
+
+        // Search results are hydrated from SQLite, so publish the row before its index entry.
+        // Keep unfinished entries local; the sync record is only written by finish().
+        self.history_db.save(&history).await?;
+        self.search_index.read().await.add_history(&history);
 
         let span = tracing::trace_span!(
             "command",
@@ -326,7 +335,7 @@ impl HistoryJournal {
             span,
             finalization_mutex: Arc::new(tokio::sync::Mutex::new(())),
         });
-        id
+        Ok(id)
     }
 
     /// The in-flight command recorded under `history_id`.
@@ -340,7 +349,7 @@ impl HistoryJournal {
             .ok_or(GetCmdInFlightError::NotFound(history_id))
     }
 
-    /// Mark a command as finished, persisting it to the history store and database.
+    /// Mark a command as finished, updating its local row and writing its sync record.
     ///
     /// `duration` is the measured runtime of the command; callers that don't have one can derive it
     /// from the start timestamp via [`HistoryJournal::get`].
@@ -373,7 +382,7 @@ impl HistoryJournal {
         span.record("duration", history.duration);
 
         self.history_db
-            .save(&history)
+            .update(&history)
             .instrument(span.clone())
             .await
             .map_err(|e| CmdFinishError::HistoryDbFailed(e.into()))?;
@@ -402,11 +411,6 @@ impl HistoryJournal {
             tracing::warn!("packing failed: {e}");
         }
 
-        // TODO(#4052): This is inherently racy -- any add_history operations added between this
-        //              .read() and the subsequent .write() are completely discarded from the new
-        //              index.
-        self.search_index.read().await.add_history(&history);
-
         if self.broadcast.receiver_count() > 0 {
             let _ = self.broadcast.send(CmdEvent::Finished(history));
         }
@@ -417,8 +421,12 @@ impl HistoryJournal {
         })
     }
 
-    /// Cancel a command, discarding its in-memory state -- and any output captured for it.
-    pub async fn cancel(&self, history_id: HistoryId) -> Result<(), CmdCancelError> {
+    /// Cancel a command, removing its local row and index entry without creating a sync record.
+    pub async fn cancel(
+        &self,
+        history_id: HistoryId,
+        search_settings: &Search,
+    ) -> Result<(), CmdCancelError> {
         let _lifecycle = self.lifecycle_mutex.lock(&history_id).await;
 
         let lock = self
@@ -431,6 +439,11 @@ impl HistoryJournal {
         if !self.active_cmds.contains_key(&history_id) {
             return Err(CmdCancelError::NotFound(history_id));
         }
+        self.history_db
+            .delete_rows([history_id])
+            .await
+            .map_err(|e| CmdCancelError::HistoryDbFailed(e.into()))?;
+        self.reload_search_index(search_settings).await;
 
         if let Err(err) = self.output_capture.remove([history_id]).await {
             tracing::error!(
@@ -502,6 +515,13 @@ impl HistoryJournal {
                 let mutex = self.active_cmds.get(&id).map(|cmd| cmd.finalization_mutex.clone());
                 let cancelled = if let Some(mutex) = mutex {
                     let _lock = mutex.lock().await;
+                    if self.active_cmds.contains_key(&id) {
+                        self.history_db
+                            .delete_rows([id])
+                            .await
+                            .map_err(|e| CmdDeleteError::HistoryDbFailed(e.into()))?;
+                        self.reload_search_index(search_settings).await;
+                    }
                     match self.active_cmds.remove(&id) {
                         Some((_id, cmd)) => {
                             let _ = self.broadcast.send(CmdEvent::Cancelled(cmd.history));
@@ -709,10 +729,11 @@ mod tests {
 
     /// A broken output store must not sink a deletion: the entry the user asked to forget is still
     /// removed rather than the whole delete being refused.
+    #[rstest::rstest]
     #[tokio::test]
     async fn delete_survives_a_broken_output_store() {
         let (journal, _tmp) = journal(OutputCaptureEngine::failing()).await;
-        let id = journal.start_cmd(entry("echo goodbye"));
+        let id = journal.start_cmd(entry("echo goodbye")).await.unwrap();
         journal.finish(id, 0, Duration::from_millis(1)).await.unwrap();
 
         let deleted = journal

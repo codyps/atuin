@@ -42,7 +42,7 @@ async fn concurrent_shells_never_lose_records(#[case] shells: usize) {
     let tasks = (0..shells).map(|i| {
         let journal = env.journal.clone();
         tokio::spawn(async move {
-            let id = journal.start_cmd(history(&format!("shell {i} cmd")));
+            let id = journal.start_cmd(history(&format!("shell {i} cmd"))).await.unwrap();
             journal.finish(id, 0, Duration::from_millis(1)).await.unwrap();
             id
         })
@@ -87,7 +87,7 @@ async fn duplicate_lifecycle_calls_resolve_to_exactly_one_winner(#[case] second:
     // the first racer is a finish, so a create exists only when it -- `a` -- won).
     let mut wins = 0usize;
     for round in 0..20 {
-        let id = env.journal.start_cmd(history(&format!("dup {round}")));
+        let id = env.journal.start_cmd(history(&format!("dup {round}"))).await.unwrap();
         let j1 = env.journal.clone();
         let j2 = env.journal.clone();
         let first =
@@ -95,7 +95,7 @@ async fn duplicate_lifecycle_calls_resolve_to_exactly_one_winner(#[case] second:
         let other = tokio::spawn(async move {
             match second {
                 Second::End => j2.finish(id, 0, Duration::from_millis(1)).await.is_ok(),
-                Second::Cancel => j2.cancel(id).await.is_ok(),
+                Second::Cancel => j2.cancel(id, &Search::default()).await.is_ok(),
             }
         });
         let (a, b) = (first.await.unwrap(), other.await.unwrap());
@@ -136,7 +136,7 @@ async fn delete_racing_finish_leaves_no_row_anywhere() {
     let mut leaked_local = Vec::new();
     let mut leaked_replay = Vec::new();
     for round in 0..40 {
-        let id = env.journal.start_cmd(history(&format!("race {round}")));
+        let id = env.journal.start_cmd(history(&format!("race {round}"))).await.unwrap();
         let j1 = env.journal.clone();
         let j2 = env.journal.clone();
         let finish = tokio::spawn(async move { j1.finish(id, 0, Duration::from_millis(1)).await });
@@ -189,7 +189,7 @@ async fn commands_finished_during_an_index_reload_are_searchable(#[case] reload:
     let mut finished = Vec::new();
     while !reload_task.is_finished() && finished.len() < 200 {
         let cmd = format!("during-reload {}", finished.len());
-        let id = env.journal.start_cmd(history(&cmd));
+        let id = env.journal.start_cmd(history(&cmd)).await.unwrap();
         env.journal.finish(id, 0, Duration::from_millis(1)).await.unwrap();
         finished.push((id, cmd));
         tokio::task::yield_now().await;
@@ -359,7 +359,7 @@ async fn end_history_is_not_starved_by_an_index_reload() {
     // One uncontended finish, measured before the racing reload starts: the yardstick the final
     // assertion compares `hook_latency` against, since "reload time / 2" carries only a ~20%
     // margin over the observed 0.60-0.63x ratio and flakes.
-    let throwaway = env.journal.start_cmd(history("uncontended calibration"));
+    let throwaway = env.journal.start_cmd(history("uncontended calibration")).await.unwrap();
     let started = Instant::now();
     env.journal.finish(throwaway, 0, Duration::from_millis(1)).await.unwrap();
     let uncontended = started.elapsed();
@@ -381,7 +381,7 @@ async fn end_history_is_not_starved_by_an_index_reload() {
     // Recorded for the diagnostics only -- the verdict is the hook latency below.
     let writer_queued = !writer.is_finished();
 
-    let id = env.journal.start_cmd(history("precmd hook"));
+    let id = env.journal.start_cmd(history("precmd hook")).await.unwrap();
     let started = Instant::now();
     env.journal.finish(id, 0, Duration::from_millis(1)).await.unwrap();
     let hook_latency = started.elapsed();
@@ -462,22 +462,33 @@ async fn synced_history_during_a_reload_is_searchable() {
 #[tokio::test]
 async fn tail_reports_lag_instead_of_dropping_silently() {
     let env = TestEnv::builder().build().await;
-    let mut client = env.history_client().await;
-    let mut tail = client.tail_history().await.unwrap();
+    use atuin_daemon::grpc::HistoryService;
+    use atuin_daemon::grpc::history::pb::TailHistoryRequest;
+    use atuin_daemon::grpc::history::pb::history_server::History as _;
+    use futures::StreamExt;
+
+    // Hold the service stream unpolled. Async start writes yield to the runtime, so a
+    // background HTTP/2 sender would otherwise drain the broadcast buffer during the burst.
+    let service = HistoryService::new(env.journal.clone(), env.handle.clone());
+    let mut tail = service
+        .tail_history(tonic::Request::new(TailHistoryRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
     const STARTS: u64 = 300; // well past the 128-event broadcast buffer
 
     for i in 0..STARTS {
-        let _ = env.journal.start_cmd(history(&format!("burst {i}")));
+        let _ = env.journal.start_cmd(history(&format!("burst {i}"))).await.unwrap();
     }
 
-    let first = tail.message().await.unwrap().unwrap();
+    let first = tail.next().await.unwrap().unwrap();
     let dropped = match first.event {
         Some(Event::Lagged(lagged)) => lagged.dropped,
         other => panic!("expected an in-band Lagged notice first, got {other:?}"),
     };
     let mut received = 0;
-    while let Ok(Some(reply)) =
-        tokio::time::timeout(Duration::from_millis(200), tail.message()).await.unwrap_or(Ok(None))
+    while let Some(Ok(reply)) =
+        tokio::time::timeout(Duration::from_millis(200), tail.next()).await.unwrap_or(None)
     {
         assert!(matches!(reply.event, Some(Event::Started(_))), "{reply:?}");
         received += 1;
@@ -538,12 +549,15 @@ async fn tail_orders_events_per_command_under_concurrency() {
 /// Registers racing deletes, cancels and finishes over a small id set must leave the store holding
 /// output only for commands that are still in flight or persisted -- the invariant the per-id gate
 /// and the deletion marks exist to keep -- under scheduling the harness does not control.
+#[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn captures_never_outlive_their_entries_under_contention() {
     let env = TestEnv::builder().build().await;
     for round in 0..20 {
-        let ids: Vec<HistoryId> =
-            (0..8).map(|i| env.journal.start_cmd(history(&format!("race {round} {i}")))).collect();
+        let mut ids = Vec::new();
+        for i in 0..8 {
+            ids.push(env.journal.start_cmd(history(&format!("race {round} {i}"))).await.unwrap());
+        }
         let mut tasks = Vec::new();
         for (i, id) in ids.iter().copied().enumerate() {
             let journal = env.journal.clone();
@@ -557,7 +571,7 @@ async fn captures_never_outlive_their_entries_under_contention() {
                         let _ = journal.delete(&[id], &Search::default()).await;
                     }
                     1 => {
-                        let _ = journal.cancel(id).await;
+                        let _ = journal.cancel(id, &Search::default()).await;
                     }
                     _ => {
                         let _ = journal.finish(id, 0, Duration::from_millis(1)).await;

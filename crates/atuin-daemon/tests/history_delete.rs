@@ -271,7 +271,7 @@ async fn delete_failure_keeps_rows_until_retry() {
 #[tokio::test]
 async fn failed_finish_keeps_the_command_in_flight(#[case] lock_history_db: bool) {
     let env = TestEnv::builder().build().await;
-    let id = env.journal.start_cmd(history("echo flaky"));
+    let id = env.journal.start_cmd(history("echo flaky")).await.unwrap();
 
     let lock = if lock_history_db {
         env.lock_history_db().await
@@ -287,7 +287,7 @@ async fn failed_finish_keeps_the_command_in_flight(#[case] lock_history_db: bool
         other => panic!("unexpected error class: {other:?}"),
     }
     assert!(env.journal.get(id).is_ok(), "the command must still be in flight");
-    assert_eq!(env.index_count().await, 0, "nothing may be indexed before persistence succeeds");
+    assert_eq!(env.index_count().await, 1, "the running command remains searchable");
     lock.release().await;
 
     env.journal.finish(id, 0, Duration::from_millis(1)).await.unwrap();
@@ -311,7 +311,7 @@ async fn delete_forgets_captured_output(
     #[future(awt)] env: TestEnv,
     #[values(true, false)] finished: bool,
 ) {
-    let id = env.journal.start_cmd(history("echo secret"));
+    let id = env.journal.start_cmd(history("echo secret")).await.unwrap();
     if finished {
         env.journal.finish(id, 0, Duration::from_millis(1)).await.unwrap();
     }
@@ -357,7 +357,7 @@ async fn output_for_a_deleted_or_unknown_id_is_refused(
     #[future(awt)] env: TestEnv,
     #[values(true, false)] finished: bool,
 ) {
-    let deleted = env.journal.start_cmd(history("echo secret"));
+    let deleted = env.journal.start_cmd(history("echo secret")).await.unwrap();
     if finished {
         env.journal.finish(deleted, 0, Duration::from_millis(1)).await.unwrap();
     }
@@ -391,11 +391,11 @@ async fn refused_output_is_not_found_over_the_wire(#[future(awt)] env: TestEnv) 
 #[rstest]
 #[tokio::test]
 async fn cancel_discards_captured_output(#[future(awt)] env: TestEnv) {
-    let id = env.journal.start_cmd(history("echo failed"));
+    let id = env.journal.start_cmd(history("echo failed")).await.unwrap();
     env.journal.register_command_output(id, capture("boom")).await.unwrap();
     assert!(env.journal.get_command_output(id).await.unwrap().is_some());
 
-    env.journal.cancel(id).await.unwrap();
+    env.journal.cancel(id, &Search::default()).await.unwrap();
 
     assert!(env.journal.get_command_output(id).await.unwrap().is_none());
     let err = env.journal.register_command_output(id, capture("late")).await.unwrap_err();

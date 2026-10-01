@@ -99,7 +99,7 @@ async fn apply(env: &TestEnv, model: &mut Model, op: &Op) {
             if *state != State::Fresh {
                 return; // ids are single-use over the wire; the model never restarts one
             }
-            let id = env.journal.start_cmd(h.clone());
+            let id = env.journal.start_cmd(h.clone()).await.unwrap();
             assert_eq!(id, h.id);
             *state = State::InFlight;
             model.expected_events.push((Kind::Started, h.id));
@@ -118,7 +118,7 @@ async fn apply(env: &TestEnv, model: &mut Model, op: &Op) {
         }
         Op::Cancel(slot) => {
             let id = model.id(*slot);
-            let result = env.journal.cancel(id).await;
+            let result = env.journal.cancel(id, &Search::default()).await;
             let (_, state) = &mut model.slots[usize::from(*slot)];
             if *state == State::InFlight {
                 result.expect("cancelling an in-flight command");
@@ -195,13 +195,19 @@ async fn check_invariants(env: &TestEnv, model: &Model, step: usize, op: &Op) {
         );
     }
     let persisted = model.persisted();
-    assert_eq!(env.active_ids().await, persisted, "{ctx}: history db");
-    assert_eq!(env.index_count().await, persisted.len(), "{ctx}: index size");
+    let visible: HashSet<_> = model
+        .slots
+        .iter()
+        .filter(|(_, s)| matches!(s, State::InFlight | State::Persisted))
+        .map(|(h, _)| h.id)
+        .collect();
+    assert_eq!(env.active_ids().await, visible, "{ctx}: history db");
+    assert_eq!(env.index_count().await, visible.len(), "{ctx}: index size");
     for (h, state) in &model.slots {
         let hits = env.index_hits(&h.command).await;
         assert_eq!(
             hits.contains(&h.id),
-            *state == State::Persisted,
+            matches!(state, State::InFlight | State::Persisted),
             "{ctx}: index view of {}",
             h.command
         );

@@ -314,9 +314,9 @@ async fn test_rebuild_history(#[future(awt)] env: TestEnv) {
 #[tokio::test]
 async fn journal_delete_removes_entry_and_rebuilds_index(#[future(awt)] env: TestEnv) {
     let journal = &env.journal;
-    let id_a = journal.start_cmd(history("delete_me"));
+    let id_a = journal.start_cmd(history("delete_me")).await.unwrap();
     journal.finish(id_a, 0, Duration::from_millis(1)).await.unwrap();
-    let id_b = journal.start_cmd(history("keep_me"));
+    let id_b = journal.start_cmd(history("keep_me")).await.unwrap();
     journal.finish(id_b, 0, Duration::from_millis(1)).await.unwrap();
     assert_eq!(env.index_count().await, 2);
 
@@ -332,9 +332,9 @@ async fn journal_delete_removes_entry_and_rebuilds_index(#[future(awt)] env: Tes
 #[tokio::test]
 async fn journal_rebuild_reloads_index(#[future(awt)] env: TestEnv) {
     let journal = &env.journal;
-    let id_a = journal.start_cmd(history("first_cmd"));
+    let id_a = journal.start_cmd(history("first_cmd")).await.unwrap();
     journal.finish(id_a, 0, Duration::from_millis(1)).await.unwrap();
-    let id_b = journal.start_cmd(history("second_cmd"));
+    let id_b = journal.start_cmd(history("second_cmd")).await.unwrap();
     journal.finish(id_b, 0, Duration::from_millis(1)).await.unwrap();
     assert_eq!(env.index_count().await, 2);
 

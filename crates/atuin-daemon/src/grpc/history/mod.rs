@@ -265,7 +265,8 @@ impl GrpcService for Service {
     ) -> Result<Response<StartHistoryReply>, Status> {
         let history: History = request.into_inner().try_into()?;
 
-        let id = self.journal.start_cmd(history);
+        let id =
+            self.journal.start_cmd(history).await.map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(StartHistoryReply {
             id: Some(id.into()),
@@ -309,10 +310,13 @@ impl GrpcService for Service {
         let id: HistoryId = request.into_inner().try_into()?;
 
         let journal = self.journal.clone();
+        let search = self.daemon_handle.settings().await.search.clone();
         // Spawned so a client disconnect cannot drop the call half-way.
-        tokio::spawn(async move { journal.cancel(id).await }.instrument(tracing::Span::current()))
-            .await
-            .map_err(|e| Status::internal(format!("cancel did not complete: {e}")))??;
+        tokio::spawn(
+            async move { journal.cancel(id, &search).await }.instrument(tracing::Span::current()),
+        )
+        .await
+        .map_err(|e| Status::internal(format!("cancel did not complete: {e}")))??;
 
         Ok(Response::new(CancelHistoryReply {
             // TODO(markovejnovic): Pull this from one constant, well-defined spot.
