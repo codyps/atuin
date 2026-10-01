@@ -232,6 +232,7 @@ impl From<CmdCancelError> for Status {
     fn from(value: CmdCancelError) -> Self {
         match value {
             CmdCancelError::NotFound(_) => Self::not_found(value.to_string()),
+            CmdCancelError::HistoryDbFailed(_) => Self::internal(value.to_string()),
         }
     }
 }

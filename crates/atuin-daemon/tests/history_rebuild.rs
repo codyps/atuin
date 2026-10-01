@@ -75,7 +75,9 @@ async fn rebuild_leaves_in_flight_commands_alone(#[future(awt)] env: TestEnv) {
     client.rebuild_history().await.unwrap();
 
     assert!(env.journal.get(running).is_ok());
-    assert!(env.history_db.load(running).await.unwrap().is_none(), "not persisted yet");
+    let pending = env.history_db.load(running).await.unwrap().expect("running row");
+    assert_eq!((pending.exit, pending.duration), (-1, -1));
+    assert_eq!(env.index_hits("sleep 30").await, vec![running]);
     client.end_history(running, Some(Duration::from_secs(30)), 0).await.unwrap();
     assert_eq!(env.active_ids().await, HashSet::from([running]));
     assert_eq!(env.index_hits("sleep 30").await, vec![running]);

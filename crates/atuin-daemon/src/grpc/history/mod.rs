@@ -265,7 +265,8 @@ impl GrpcService for Service {
     ) -> Result<Response<StartHistoryReply>, Status> {
         let history: History = request.into_inner().try_into()?;
 
-        let id = self.journal.start_cmd(history);
+        let id =
+            self.journal.start_cmd(history).await.map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(StartHistoryReply {
             id: Some(id.into()),
@@ -308,7 +309,7 @@ impl GrpcService for Service {
     ) -> Result<Response<CancelHistoryReply>, Status> {
         let id: HistoryId = request.into_inner().try_into()?;
 
-        self.journal.cancel(id).await?;
+        self.journal.cancel(id, &self.daemon_handle.settings().await.search).await?;
 
         Ok(Response::new(CancelHistoryReply {
             // TODO(markovejnovic): Pull this from one constant, well-defined spot.
