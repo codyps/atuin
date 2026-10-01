@@ -268,7 +268,7 @@ async fn delete_failure_keeps_rows_until_retry() {
 #[rstest]
 #[tokio::test]
 async fn failed_store_write_keeps_the_command_in_flight(#[future(awt)] env: TestEnv) {
-    let id = env.journal.start_cmd(history("echo flaky"));
+    let id = env.journal.start_cmd(history("echo flaky")).await.unwrap();
 
     let lock = env.lock_record_store().await;
     let Err(err) = env.journal.finish(id, 0, Duration::from_millis(1)).await else {
@@ -276,7 +276,7 @@ async fn failed_store_write_keeps_the_command_in_flight(#[future(awt)] env: Test
     };
     assert!(matches!(err, CmdFinishError::HistoryStoreFailed(_)), "{err:?}");
     assert!(env.journal.get(id).is_ok(), "the command must still be in flight");
-    assert_eq!(env.index_count().await, 0, "nothing may be indexed before persistence succeeds");
+    assert_eq!(env.index_count().await, 1, "the running command remains searchable");
     lock.release().await;
 
     env.journal.finish(id, 0, Duration::from_millis(1)).await.unwrap();
@@ -291,7 +291,7 @@ async fn failed_store_write_keeps_the_command_in_flight(#[future(awt)] env: Test
 #[rstest]
 #[tokio::test]
 async fn failed_history_db_write_still_records_the_command(#[future(awt)] env: TestEnv) {
-    let id = env.journal.start_cmd(history("echo flaky"));
+    let id = env.journal.start_cmd(history("echo flaky")).await.unwrap();
 
     let lock = env.lock_history_db().await;
     env.journal.finish(id, 0, Duration::from_millis(1)).await.unwrap();
@@ -299,10 +299,13 @@ async fn failed_history_db_write_still_records_the_command(#[future(awt)] env: T
 
     assert!(env.journal.get(id).is_err(), "a recorded command is no longer in flight");
     assert_eq!(creates(&env).await, 1);
-    assert!(env.active_ids().await.is_empty(), "the history.db write failed");
+    // `start_cmd` published the running row; the failed finish update leaves it unfinished.
+    assert_eq!(env.active_ids().await, HashSet::from([id]));
+    assert_eq!(env.running_rows().await, 1, "the history.db write failed");
 
     env.journal.rebuild(&Search::default()).await.unwrap();
     assert_eq!(env.active_ids().await, HashSet::from([id]));
+    assert_eq!(env.running_rows().await, 0, "the rebuild restored the finished row");
     assert_eq!(env.index_count().await, 1);
 }
 
@@ -313,7 +316,7 @@ async fn failed_history_db_write_still_records_the_command(#[future(awt)] env: T
 async fn output_after_a_failed_history_db_write_is_kept(#[future(awt)] env: TestEnv) {
     let output = OutputCapture::Enabled(CaptureLimits::default());
     let files = SensitiveFiles::default();
-    let id = env.journal.start_cmd(history("echo flaky"));
+    let id = env.journal.start_cmd(history("echo flaky")).await.unwrap();
 
     let lock = env.lock_history_db().await;
     env.journal.finish(id, 0, Duration::from_millis(1)).await.unwrap();
@@ -343,7 +346,7 @@ async fn output_after_a_failed_history_db_write_is_kept(#[future(awt)] env: Test
 async fn a_finish_dropped_after_its_record_is_stored_is_not_in_flight(#[future(awt)] env: TestEnv) {
     let output = OutputCapture::Enabled(CaptureLimits::default());
     let files = SensitiveFiles::default();
-    let id = env.journal.start_cmd(history("echo dropped"));
+    let id = env.journal.start_cmd(history("echo dropped")).await.unwrap();
 
     let lock = env.lock_history_db().await;
     let finish = env.journal.finish(id, 0, Duration::from_millis(1));
@@ -376,7 +379,7 @@ async fn delete_forgets_captured_output(
     #[future(awt)] env: TestEnv,
     #[values(true, false)] finished: bool,
 ) {
-    let id = env.journal.start_cmd(history("echo secret"));
+    let id = env.journal.start_cmd(history("echo secret")).await.unwrap();
     if finished {
         env.journal.finish(id, 0, Duration::from_millis(1)).await.unwrap();
     }
@@ -430,7 +433,7 @@ async fn output_for_a_deleted_or_unknown_id_is_refused(
     #[future(awt)] env: TestEnv,
     #[values(true, false)] finished: bool,
 ) {
-    let deleted = env.journal.start_cmd(history("echo secret"));
+    let deleted = env.journal.start_cmd(history("echo secret")).await.unwrap();
     if finished {
         env.journal.finish(deleted, 0, Duration::from_millis(1)).await.unwrap();
     }
@@ -473,7 +476,7 @@ async fn refused_output_is_not_found_over_the_wire(#[future(awt)] env: TestEnv) 
 #[rstest]
 #[tokio::test]
 async fn cancel_discards_captured_output(#[future(awt)] env: TestEnv) {
-    let id = env.journal.start_cmd(history("echo failed"));
+    let id = env.journal.start_cmd(history("echo failed")).await.unwrap();
     env.journal
         .register_command_output(
             id,
@@ -485,7 +488,7 @@ async fn cancel_discards_captured_output(#[future(awt)] env: TestEnv) {
         .unwrap();
     assert!(env.journal.get_command_output(id).await.unwrap().is_some());
 
-    env.journal.cancel(id).await.unwrap();
+    env.journal.cancel(id, &Search::default()).await.unwrap();
 
     assert!(env.journal.get_command_output(id).await.unwrap().is_none());
     let err = env

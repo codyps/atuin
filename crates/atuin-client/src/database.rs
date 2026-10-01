@@ -459,7 +459,11 @@ impl Sqlite {
 
         while h.peek().is_some() {
             let mut builder = sqlx::QueryBuilder::new(
-                "insert or ignore into history(
+                // Callers replay records from the store, which is the source of truth, so a
+                // conflicting row is overwritten -- not ignored. In particular the daemon saves a
+                // still-unfinished row when a command starts (`HistoryJournal::start_cmd`), and a
+                // rebuild must turn that row into the finished one its create record carries.
+                "insert or replace into history(
                     id, timestamp, duration, exit, command, cwd, session, hostname, author, intent,
                     deleted_at, shell, author_kind
                 ) ",

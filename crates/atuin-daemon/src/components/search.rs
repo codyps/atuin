@@ -9,7 +9,7 @@ use std::sync::Arc;
 use atuin_common::filter::OrFilter;
 use atuin_common::path::DisplayRichExt;
 use eyre::Result;
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use tokio::sync::RwLock;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};

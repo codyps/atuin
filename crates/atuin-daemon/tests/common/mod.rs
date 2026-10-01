@@ -360,6 +360,19 @@ impl TestEnv {
         self.history_db.history_count(false).await.unwrap()
     }
 
+    /// Rows in the history db for commands that were started but never finished (`exit = -1`).
+    pub async fn running_rows(&self) -> i64 {
+        let db = CommonSqlite::builder(self.settings.db_path.as_os_str())
+            .timeout(Duration::from_secs(5))
+            .open()
+            .await
+            .expect("open a second connection to the history db");
+        atuin_common::db::query_scalar("select count(1) from history where exit = -1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    }
+
     /// Rows in the history db with exactly this `(timestamp, cwd, command)`: the triple the
     /// table's unique index dedups on. Uses its own connection because [`Sqlite`] keeps its pool
     /// private.
