@@ -74,6 +74,7 @@ service-manager = { workspace = true }
 
 [dev-dependencies]
 atuin-common = { workspace = true, features = ["test-utils"] }
+divan = { workspace = true }
 proptest = { workspace = true }
 regex = { workspace = true }
 rstest = { workspace = true }
@@ -84,7 +85,9 @@ tokio = { workspace = true, features = ["test-util"] }
 protox = { workspace = true }
 tonic-prost-build = { workspace = true }
 
-
+[[bench]]
+name = "metadata"
+harness = false
 
 [lints]
 workspace = true
